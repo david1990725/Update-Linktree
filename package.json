@@ -1,0 +1,16 @@
+{
+  "name": "update-linktree",
+  "version": "1.0.0",
+  "description": "Scrape Facebook monthly posts and update Linktree",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "setup": "node setup.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.6.0",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.49.0"
+  }
+}
