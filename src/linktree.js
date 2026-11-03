@@ -303,7 +303,7 @@ export async function scanLinktreeItems(page) {
 
 /**
  * 更新 Profile Bio（簡介）的特別休館日資訊
- * 流程：點選 Bio → 清空 → 填入新內容（若有）→ 點選 Save → 等待 5 秒
+ * 填入 Bio 後儲存 Header 草稿，重新載入確認內容已保存。
  * @param {import('playwright').Page} page
  * @param {string} closedDatesString - 休館日文字，空字串表示清空 Bio
  */
@@ -322,7 +322,7 @@ export async function updateLinktreeBio(page, closedDatesString) {
     // The explicit count below produces the actionable error message.
   }
 
-  // New UI uses an autosaving textarea. Do not use the AI chat textarea.
+  // Do not use the AI chat textarea.
   let bioTextarea = page.locator('textarea[placeholder="Add a short bio"]').first();
 
   // Keep compatibility with the classic Linktree editor.
@@ -334,9 +334,26 @@ export async function updateLinktreeBio(page, closedDatesString) {
     throw new Error('找不到 Linktree Bio 欄位，無法確認休館日是否寫入。');
   }
 
-  await bioTextarea.fill(textToWrite, { force: true });
-  await bioTextarea.press('Tab');
-  await page.waitForTimeout(2500);
+  const originalBio = await bioTextarea.inputValue();
+  if (originalBio !== textToWrite) {
+    await bioTextarea.fill(textToWrite, { force: true });
+    await bioTextarea.press('Tab');
+    const saveButton = page.getByRole('button', { name: 'Save design draft' });
+    await saveButton.waitFor({ state: 'visible', timeout: 10000 });
+    await saveButton.click();
+    await page.waitForFunction(() => {
+      const button = [...document.querySelectorAll('button')].find(element =>
+        element.getAttribute('aria-label') === 'Save design draft' ||
+        element.textContent.trim() === 'Save'
+      );
+      return !button || button.disabled;
+    }, null, { timeout: 20000 });
+  }
+
+  // An input value alone can be an unsaved draft. Verify the persisted value.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await waitForPageReady(page);
+  await bioTextarea.waitFor({ state: 'visible', timeout: 20000 });
 
   const savedBio = normalizeTitle(await bioTextarea.inputValue());
   if (savedBio !== normalizeTitle(textToWrite)) {
