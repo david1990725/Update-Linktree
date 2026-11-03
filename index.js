@@ -221,6 +221,9 @@ async function main() {
     process.exitCode = 1;
   } finally {
     await browserSession?.context.close().catch(() => null);
+    // Dashboard launches this file with an IPC channel. Disconnect it after
+    // the sync finishes so the dashboard receives the child exit event.
+    if (process.connected) process.disconnect();
   }
 }
 
