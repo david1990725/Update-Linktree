@@ -1,6 +1,183 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
-import { BROWSER_DATA_DIR, BROWSER_OPTIONS, isUrl } from './config.js';
+import {
+  BROWSER_DATA_DIR,
+  BROWSER_OPTIONS,
+  LINKTREE_ADMIN_URL,
+  LINKTREE_HEADER_URL,
+  isUrl
+} from './config.js';
+
+const NEW_UI_LINKS_PANEL = '#layout-unified-editor-panel-links';
+
+function normalizeTitle(value) {
+  return String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function waitForPageReady(page) {
+  await page.waitForTimeout(1500);
+  try {
+    await page.waitForSelector('body', { timeout: 10000 });
+  } catch (_) {
+    // The page may already be usable even if the body selector timed out.
+  }
+}
+
+async function isNewLinktreeLinksPage(page) {
+  return page.url().includes('/admin/links') &&
+    !page.url().includes('/admin/links/edit/') &&
+    await page.locator(NEW_UI_LINKS_PANEL).count() > 0;
+}
+
+async function waitForNewUiContent(page) {
+  await page.waitForSelector(
+    `${NEW_UI_LINKS_PANEL} button[data-block-id], ${NEW_UI_LINKS_PANEL} button:has-text("Add collection")`,
+    { timeout: 20000 }
+  );
+}
+
+/**
+ * Return the top-level Collections without assuming that all of them can stay
+ * open at once. The new Linktree UI behaves like an accordion: opening one
+ * Collection collapses the previous one.
+ */
+async function getNewUiCollectionRefs(page) {
+  const topLevelItems = await page.locator(`${NEW_UI_LINKS_PANEL} li[data-sortable-item]`).all();
+  const refs = [];
+
+  for (const item of topLevelItems) {
+    const blockButton = item.locator('button[data-block-id]').first();
+    if (await blockButton.count() === 0) continue;
+
+    const id = await blockButton.getAttribute('data-block-id');
+    if (!id) continue;
+
+    // A normal top-level link has a matching data-link-id. A Collection does
+    // not; its child links have different ids.
+    if (await item.locator(`[data-link-id="${id}"]`).count() > 0) continue;
+    refs.push({ id, title: normalizeTitle(await blockButton.innerText().catch(() => '')) });
+  }
+
+  return refs;
+}
+
+async function openNewUiCollection(page, id) {
+  const item = page.locator(
+    `${NEW_UI_LINKS_PANEL} li[data-sortable-item] button[data-block-id="${id}"]`
+  ).first().locator('xpath=ancestor::li[@data-sortable-item][1]');
+  if (await item.count() === 0) return null;
+
+  if (await item.locator('input[data-testid="collection-title-input"]').count() === 0) {
+    const button = item.locator('button[data-block-id]').first();
+    console.log(`[Linktree] Expanding collection: ${normalizeTitle(await button.innerText().catch(() => ''))}`);
+    await button.click();
+    await page.waitForTimeout(450);
+  }
+  return item;
+}
+
+async function readNewUiCardTitle(card) {
+  const titleNode = card.locator('span.truncate').first();
+  if (await titleNode.count() > 0) {
+    return normalizeTitle(await titleNode.innerText());
+  }
+
+  const firstLine = (await card.innerText().catch(() => '')).split('\n')[0];
+  return normalizeTitle(firstLine);
+}
+
+async function readCollectionTitleForCard(card) {
+  const collection = card.locator('xpath=ancestor::li[@data-sortable-item][1]');
+  const titleInput = collection.locator('input[data-testid="collection-title-input"]').first();
+  if (await titleInput.count() > 0) {
+    return normalizeTitle(await titleInput.inputValue());
+  }
+  return '';
+}
+
+async function scanNewUiItems(page) {
+  const items = [];
+
+  // Scan normal top-level links before opening any Collection.
+  const topLevelItems = await page.locator(`${NEW_UI_LINKS_PANEL} li[data-sortable-item]`).all();
+  for (const item of topLevelItems) {
+    const blockButton = item.locator('button[data-block-id]').first();
+    if (await blockButton.count() === 0) continue;
+    const id = await blockButton.getAttribute('data-block-id');
+    if (!id || await item.locator(`[data-link-id="${id}"]`).count() === 0) continue;
+
+    const card = item.locator(`[data-link-id="${id}"]`).first();
+    const title = await readNewUiCardTitle(card);
+    if (!title) continue;
+    items.push({
+      id,
+      title,
+      url: '',
+      type: 'link',
+      active: await card.locator('button[aria-label="Show link"]').count() === 0,
+      collectionTitle: ''
+    });
+  }
+
+  // Scan each Collection while it is open, because the UI only keeps one
+  // Collection expanded at a time.
+  const collectionRefs = await getNewUiCollectionRefs(page);
+  for (const ref of collectionRefs) {
+    const collection = await openNewUiCollection(page, ref.id);
+    if (!collection) continue;
+
+    const titleInput = collection.locator('input[data-testid="collection-title-input"]').first();
+    const title = normalizeTitle(await titleInput.inputValue().catch(() => ref.title));
+    if (title) {
+      items.push({
+        id: ref.id,
+        title,
+        url: '',
+        type: 'header',
+        active: true
+      });
+    }
+
+    const cards = await collection.locator('[data-link-id]').all();
+    for (const card of cards) {
+      const cardTitle = await readNewUiCardTitle(card);
+      if (!cardTitle) continue;
+
+      const id = await card.getAttribute('data-link-id');
+      items.push({
+        id: id || '',
+        title: cardTitle,
+        url: '',
+        type: 'link',
+        active: await card.locator('button[aria-label="Show link"]').count() === 0,
+        collectionTitle: title
+      });
+    }
+  }
+
+  return items;
+}
+
+async function getNewUiCollectionCards(collection) {
+  const rows = await collection.locator('li[data-child-sortable="true"]').all();
+  const cards = [];
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const card = row.locator('[data-link-id]').first();
+    const id = await card.getAttribute('data-link-id');
+    if (!id) continue;
+    cards.push({
+      id,
+      title: await readNewUiCardTitle(card),
+      active: await card.locator('button[aria-label="Show link"]').count() === 0,
+      index
+    });
+  }
+  return cards;
+}
 
 // ─── Browser Session ────────────────────────────────────
 
@@ -17,16 +194,19 @@ export async function launchLinktreeSession() {
   const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, BROWSER_OPTIONS);
   const page = await context.newPage();
 
-  console.log('[Linktree] Navigating to Linktree Admin...');
-  await page.goto('https://linktr.ee/admin', { waitUntil: 'domcontentloaded' });
+  console.log('[Linktree] Navigating to Linktree Admin Links...');
+  await page.goto(LINKTREE_ADMIN_URL, { waitUntil: 'domcontentloaded' });
 
-  // 等待 React hydration
+  // Wait for a real editor signal instead of always sleeping for five seconds.
   console.log('[Linktree] Waiting for dashboard to load...');
-  await page.waitForTimeout(5000);
+  await Promise.race([
+    page.waitForSelector(NEW_UI_LINKS_PANEL, { timeout: 15000 }),
+    page.waitForSelector('input[name="title"]', { timeout: 15000 })
+  ]).catch(() => null);
 
-  if (page.url().includes('linktr.ee/login') || page.url().includes('linktr.ee/register')) {
+  if (page.url().includes('/login') || page.url().includes('login') || page.url().includes('register')) {
     await context.close();
-    throw new Error('Session expired. Please run "npm run setup" to re-authenticate.');
+    throw new Error('Linktree 登入憑證已過期或未登入。請先執行 "npm run setup" 登入 Linktree 與 Facebook。');
   }
 
   return { page, context };
@@ -41,6 +221,21 @@ export async function launchLinktreeSession() {
  */
 export async function scanLinktreeItems(page) {
   console.log('[Linktree] Scanning existing profile structure...');
+
+  // New Linktree experience: cards live inside Collections and are not inputs.
+  // Scan this UI first; the old input-based scanner cannot see the real cards.
+  try {
+    await page.waitForSelector(NEW_UI_LINKS_PANEL, { timeout: 12000 });
+    await waitForNewUiContent(page);
+    const newItems = await scanNewUiItems(page);
+    if (newItems.length > 0) {
+      console.log(`[Linktree] New UI scan found ${newItems.length} collections/cards.`);
+      console.log('[Linktree] Scanned items:', newItems);
+      return newItems;
+    }
+  } catch (err) {
+    console.log('[Linktree] New UI scan unavailable, falling back to classic editor:', err.message);
+  }
 
   // 等待表單元素出現（確保 React 已完成載入）
   console.log('[Linktree] Waiting for dashboard inputs to render...');
@@ -116,86 +311,42 @@ export async function updateLinktreeBio(page, closedDatesString) {
   const textToWrite = closedDatesString || '';
 
   console.log(`[Linktree] Updating Profile Bio with: "${textToWrite}"`);
+  await page.goto(LINKTREE_HEADER_URL, { waitUntil: 'domcontentloaded' });
+  await waitForPageReady(page);
   try {
-    // 1. 點選 Bio 區域以開啟編輯器
-    const profileTextSelectors = [
-      page.getByText('@kcindaan').first(),
-      page.getByText('Profile Preview').first(),
-      page.getByText('休館日').first()
-    ];
-
-    for (const selector of profileTextSelectors) {
-      if (await selector.count() > 0 && await selector.isVisible().catch(() => false)) {
-        console.log('[Linktree] Found profile area text, clicking to open Bio editor...');
-        await selector.click();
-        await page.waitForTimeout(1500);
-        break;
-      }
-    }
-
-    // 2. 定位 Bio textarea
-    const bioTextarea = page.locator('textarea[data-testid="ProfileBioTextArea"]').first();
-
-    if (await bioTextarea.count() > 0) {
-      // 3. 清空 Bio 內容
-      await bioTextarea.click();
-      await page.waitForTimeout(500);
-
-      // 全選文字
-      await bioTextarea.click({ clickCount: 3 });
-      await page.waitForTimeout(200);
-      await bioTextarea.press('Meta+A').catch(() => null);
-      await bioTextarea.press('Control+A').catch(() => null);
-      await page.waitForTimeout(200);
-
-      // 刪除文字
-      await bioTextarea.press('Backspace');
-      await page.waitForTimeout(500);
-
-      // 透過 React 原生 setter 強制清空狀態
-      await bioTextarea.evaluate(el => {
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype, 'value'
-        ).set;
-        if (nativeSetter) {
-          nativeSetter.call(el, '');
-        } else {
-          el.value = '';
-        }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      await page.waitForTimeout(500);
-
-      // 4. 填入新內容（若有）
-      if (textToWrite) {
-        await bioTextarea.fill(textToWrite, { force: true });
-        await page.waitForTimeout(500);
-      }
-
-      // 5. 點選 Save 按鈕
-      const saveBtn = page.locator('button').filter({ hasText: /^(Save|儲存)$/ }).last();
-
-      if (await saveBtn.isVisible().catch(() => false)) {
-        console.log('[Linktree] Found "Save/儲存" button, clicking...');
-        await saveBtn.click();
-      } else {
-        console.log('[Linktree] Could not find Save button, pressing Tab + Enter as fallback...');
-        await bioTextarea.press('Tab');
-        await page.waitForTimeout(200);
-        await page.keyboard.press('Enter');
-      }
-
-      // 6. 等待 hover 消失並儲存完成
-      console.log('[Linktree] Waiting 5 seconds for save to complete...');
-      await page.waitForTimeout(5000);
-      console.log('[Linktree] Profile Bio successfully updated and saved.');
-    } else {
-      console.log('[Linktree] WARNING: Could not locate Bio textarea (data-testid="ProfileBioTextArea"). Skipped.');
-    }
-  } catch (err) {
-    console.log('[Linktree] Non-critical error updating Profile Bio:', err.message);
+    await page.waitForSelector(
+      'textarea[placeholder="Add a short bio"], textarea[data-testid="ProfileBioTextArea"]',
+      { timeout: 20000 }
+    );
+  } catch (_) {
+    // The explicit count below produces the actionable error message.
   }
+
+  // New UI uses an autosaving textarea. Do not use the AI chat textarea.
+  let bioTextarea = page.locator('textarea[placeholder="Add a short bio"]').first();
+
+  // Keep compatibility with the classic Linktree editor.
+  if (await bioTextarea.count() === 0) {
+    bioTextarea = page.locator('textarea[data-testid="ProfileBioTextArea"]').first();
+  }
+
+  if (await bioTextarea.count() === 0) {
+    throw new Error('找不到 Linktree Bio 欄位，無法確認休館日是否寫入。');
+  }
+
+  await bioTextarea.fill(textToWrite, { force: true });
+  await bioTextarea.press('Tab');
+  await page.waitForTimeout(2500);
+
+  const savedBio = normalizeTitle(await bioTextarea.inputValue());
+  if (savedBio !== normalizeTitle(textToWrite)) {
+    throw new Error(`Bio 驗證失敗：目前為「${savedBio}」，預期為「${textToWrite}」。`);
+  }
+
+  console.log('[Linktree] Profile Bio updated and verified.');
+  await page.goto(LINKTREE_ADMIN_URL, { waitUntil: 'domcontentloaded' });
+  await waitForPageReady(page);
+  return { success: true, value: textToWrite };
 }
 
 // ─── Card Input Helpers ─────────────────────────────────
@@ -287,6 +438,292 @@ async function findCardInputs(form) {
   return { titleInput, urlInput };
 }
 
+// ─── New UI Card Updates ─────────────────────────────────
+
+async function ensureNewUiLinksPage(page) {
+  if (!(await isNewLinktreeLinksPage(page))) {
+    await page.goto(LINKTREE_ADMIN_URL, { waitUntil: 'domcontentloaded' });
+    await waitForPageReady(page);
+  }
+  await page.waitForSelector(NEW_UI_LINKS_PANEL, { timeout: 15000 });
+  await waitForNewUiContent(page);
+}
+
+async function findNewUiCard(page, currentTitle, id = '', collectionTitle = '') {
+  const expected = normalizeTitle(currentTitle);
+
+  const findIn = async (scope) => {
+    const cards = await scope.locator('[data-link-id]').all();
+    if (id) {
+      for (const card of cards) {
+        if ((await card.getAttribute('data-link-id')) === String(id)) return card;
+      }
+    }
+    for (const card of cards) {
+      if ((await readNewUiCardTitle(card)) === expected) return card;
+    }
+    const compactExpected = expected.replace(/\s/g, '');
+    for (const card of cards) {
+      const title = await readNewUiCardTitle(card);
+      if (title.replace(/\s/g, '') === compactExpected) return card;
+    }
+    return null;
+  };
+
+  const refs = await getNewUiCollectionRefs(page);
+
+  if (collectionTitle) {
+    const expectedCollection = normalizeTitle(collectionTitle);
+    for (const ref of refs) {
+      const collection = await openNewUiCollection(page, ref.id);
+      if (!collection) continue;
+      const input = collection.locator('input[data-testid="collection-title-input"]').first();
+      if (await input.count() > 0 && normalizeTitle(await input.inputValue()) === expectedCollection) {
+        return findIn(collection);
+      }
+    }
+    return null;
+  }
+
+  const topLevelMatch = await findIn(page.locator(NEW_UI_LINKS_PANEL));
+  if (topLevelMatch) return topLevelMatch;
+
+  for (const ref of refs) {
+    const collection = await openNewUiCollection(page, ref.id);
+    if (!collection) continue;
+    const match = await findIn(collection);
+    if (match) return match;
+  }
+
+  return null;
+}
+
+async function findNewUiCollection(page, currentTitle, newTitle = '') {
+  const candidates = [currentTitle, newTitle].map(normalizeTitle).filter(Boolean);
+
+  const refs = await getNewUiCollectionRefs(page);
+  for (const ref of refs) {
+    const collection = await openNewUiCollection(page, ref.id);
+    if (!collection) continue;
+    const input = collection.locator('input[data-testid="collection-title-input"]').first();
+    if (await input.count() === 0) continue;
+    for (const candidate of candidates) {
+      if (normalizeTitle(await input.inputValue()) === candidate) return input;
+    }
+  }
+  return null;
+}
+
+async function findVisibleButton(page, selector) {
+  const buttons = await page.locator(selector).all();
+  for (const button of buttons) {
+    if (await button.isVisible().catch(() => false)) return button;
+  }
+  return null;
+}
+
+async function waitForNewUiEditor(page) {
+  await page.waitForSelector('input[placeholder="Enter title..."]', { timeout: 15000 });
+  await page.waitForTimeout(500);
+}
+
+async function setNewUiLinkVisibility(page, action) {
+  const hideButton = await findVisibleButton(page, 'button[aria-label="Hide link"]');
+  const showButton = await findVisibleButton(page, 'button[aria-label="Show link"]');
+
+  if (action === 'toggle_off') {
+    if (hideButton) {
+      await hideButton.click();
+      await page.waitForTimeout(1200);
+      console.log('[Linktree] ✅ New UI link deactivated.');
+    } else if (showButton) {
+      console.log('[Linktree] Link is already inactive.');
+    } else {
+      throw new Error('找不到新版 Linktree 的 Hide/Show link 控制。');
+    }
+    return;
+  }
+
+  if (action === 'toggle_on' || action === 'update') {
+    if (showButton) {
+      await showButton.click();
+      await page.waitForTimeout(1200);
+      console.log('[Linktree] ✅ New UI link activated.');
+    } else if (!hideButton) {
+      throw new Error('找不到新版 Linktree 的 Hide/Show link 控制。');
+    }
+  }
+}
+
+async function updateNewUiLinkEditor(page, update) {
+  const { newTitle, newUrl, action } = update;
+
+  await setNewUiLinkVisibility(page, action);
+  if (action === 'toggle_off') return;
+
+  if (newUrl) {
+    const urlDialog = page.locator('[role="dialog"]').filter({ hasText: 'Edit URL' }).last();
+    let urlInput = urlDialog.locator('input[type="text"]').first();
+    if (!(await urlInput.isVisible().catch(() => false))) {
+      const editUrlButton = await findVisibleButton(page, 'button[aria-label="Edit URL"]');
+      if (!editUrlButton) throw new Error('找不到新版 Linktree 的 Edit URL 按鈕。');
+
+      await editUrlButton.click();
+      urlInput = urlDialog.locator('input[type="text"]').first();
+      await urlInput.waitFor({ state: 'visible', timeout: 8000 });
+    }
+
+    const currentUrl = normalizeTitle(await urlInput.inputValue());
+    if (currentUrl !== normalizeTitle(newUrl)) {
+      await urlInput.fill(newUrl);
+      const confirmButton = urlDialog.locator('button[aria-label="Confirm"]').first();
+      if (await confirmButton.count() === 0) {
+        throw new Error('找不到新版 Linktree URL 編輯器的確認按鈕。');
+      }
+
+      for (let i = 0; i < 10 && !(await confirmButton.isEnabled().catch(() => false)); i++) {
+        await page.waitForTimeout(250);
+      }
+      if (!(await confirmButton.isEnabled().catch(() => false))) {
+        throw new Error(`Linktree 拒絕此 URL：${newUrl}`);
+      }
+
+      await confirmButton.click();
+      await page.waitForTimeout(2500);
+    }
+  }
+
+  if (newTitle) {
+    const titleInput = page.locator('input[placeholder="Enter title..."]').first();
+    if (await titleInput.count() === 0) {
+      throw new Error('找不到新版 Linktree 的標題欄位。');
+    }
+
+    await titleInput.fill(newTitle);
+    await titleInput.press('Tab');
+    await page.waitForTimeout(1800);
+
+    const savedTitle = normalizeTitle(await titleInput.inputValue());
+    if (savedTitle !== normalizeTitle(newTitle)) {
+      throw new Error(`卡片標題驗證失敗：目前為「${savedTitle}」，預期為「${newTitle}」。`);
+    }
+  }
+}
+
+async function addNewUiLinkToCollection(page, update) {
+  await ensureNewUiLinksPage(page);
+  const refs = await getNewUiCollectionRefs(page);
+  let collection = null;
+  for (const ref of refs) {
+    const candidate = await openNewUiCollection(page, ref.id);
+    const titleInput = candidate?.locator('input[data-testid="collection-title-input"]').first();
+    if (titleInput && await titleInput.count() > 0 && normalizeTitle(await titleInput.inputValue()) === update.collectionTitle) {
+      collection = candidate;
+      break;
+    }
+  }
+  if (!collection) throw new Error(`找不到新增卡片所需的 Collection「${update.collectionTitle}」。`);
+
+  const beforeIds = new Set((await getNewUiCollectionCards(collection)).map(card => card.id));
+  const addButton = collection.getByRole('button', { name: 'Add' }).last();
+  if (await addButton.count() === 0) throw new Error(`找不到 Collection「${update.collectionTitle}」的 Add 按鈕。`);
+  await addButton.click();
+
+  const addDialog = page.locator('[role="dialog"]').filter({ has: page.locator('input[placeholder="Paste a link or search…"]') }).last();
+  const searchInput = addDialog.locator('input[placeholder="Paste a link or search…"]').first();
+  await searchInput.waitFor({ state: 'visible', timeout: 8000 });
+  await searchInput.fill(update.newUrl);
+  await searchInput.press('Enter');
+  await page.waitForTimeout(1200);
+
+  const afterCards = await getNewUiCollectionCards(collection);
+  const newCard = afterCards.find(card => !beforeIds.has(card.id));
+  if (!newCard) throw new Error(`Linktree 未建立「${update.newTitle}」的新卡片。`);
+
+  const cardButton = collection.locator(`[data-link-id="${newCard.id}"] button[data-block-id]`).first();
+  await cardButton.click();
+  await waitForNewUiEditor(page);
+  await updateNewUiLinkEditor(page, { ...update, action: 'update' });
+}
+
+async function applyNewUiUpdates(page, updates, onProgress) {
+  const actionOrder = { toggle_off: 0, update: 1, toggle_on: 2, add: 3 };
+  const sortedUpdates = [...updates].sort(
+    (a, b) => (actionOrder[a.action] ?? 1) - (actionOrder[b.action] ?? 1)
+  );
+  const applied = [];
+  const failed = [];
+
+  for (const update of sortedUpdates) {
+    try {
+      console.log(`\n[Linktree] ─── New UI [${String(update.action).toUpperCase()}] ───`);
+      console.log(` 👉 Current Title: "${update.currentTitle}"`);
+      console.log(` 👉 New Title    : "${update.newTitle || ''}"`);
+
+      if (update.action === 'add') {
+        if (update.collectionTitle !== '特別活動') {
+          throw new Error('新版集合模式只允許在「特別活動」新增卡片。');
+        }
+        await addNewUiLinkToCollection(page, update);
+        applied.push(update);
+        await onProgress?.({ success: true, update });
+        continue;
+      }
+
+      if (update.type === 'header') {
+        await ensureNewUiLinksPage(page);
+        const collectionInput = await findNewUiCollection(page, update.currentTitle, update.newTitle);
+        if (!collectionInput) throw new Error(`找不到 Collection「${update.currentTitle}」。`);
+
+        if (update.newTitle && normalizeTitle(await collectionInput.inputValue()) !== normalizeTitle(update.newTitle)) {
+          await collectionInput.fill(update.newTitle);
+          await collectionInput.press('Tab');
+          await page.waitForTimeout(1200);
+        }
+
+        const savedTitle = normalizeTitle(await collectionInput.inputValue());
+        if (update.newTitle && savedTitle !== normalizeTitle(update.newTitle)) {
+          throw new Error(`Collection 標題驗證失敗：目前為「${savedTitle}」。`);
+        }
+      } else {
+        if (update.id) {
+          // The scanner owns this stable Linktree ID. Going straight to the
+          // editor avoids repeatedly expanding every Collection for each card.
+          await page.goto(`${LINKTREE_ADMIN_URL}/edit/${encodeURIComponent(update.id)}`, {
+            waitUntil: 'domcontentloaded'
+          });
+        } else {
+          await ensureNewUiLinksPage(page);
+          const card = await findNewUiCard(
+            page,
+            update.currentTitle,
+            '',
+            update.collectionTitle
+          );
+          if (!card) throw new Error(`找不到卡片「${update.currentTitle}」。`);
+          await card.locator('button[data-block-id]').first().click();
+        }
+        await waitForNewUiEditor(page);
+        await updateNewUiLinkEditor(page, update);
+      }
+
+      applied.push(update);
+      await onProgress?.({ success: true, update });
+    } catch (err) {
+      console.error(`[Linktree] ❌ Update failed for "${update.currentTitle}":`, err.message);
+      failed.push({ update, error: err.message });
+      await onProgress?.({ success: false, update, error: err.message });
+      // Reopen the list before attempting the next update; a failed editor
+      // must never leave the next update operating on the wrong card.
+      await page.goto(LINKTREE_ADMIN_URL, { waitUntil: 'domcontentloaded' }).catch(() => null);
+      await waitForPageReady(page).catch(() => null);
+    }
+  }
+
+  console.log(`\n[Linktree] New UI updates finished: ${applied.length} applied, ${failed.length} failed.`);
+  return { success: failed.length === 0, applied, failed };
+}
+
 // ─── Card Updates ───────────────────────────────────────
 
 /**
@@ -294,8 +731,15 @@ async function findCardInputs(form) {
  * @param {import('playwright').Page} page
  * @param {Array<{currentTitle: string, newTitle: string, newUrl?: string, type: string, action: string}>} updates
  */
-export async function applyLinktreeUpdates(page, updates) {
+export async function applyLinktreeUpdates(page, updates, onProgress = null) {
   console.log(`[Linktree] Applying ${updates.length} updates...`);
+
+  // The redesigned Linktree editor has no input[name="title"] list. Route
+  // the whole batch through the collection-aware implementation instead of
+  // silently skipping cards that the old editor cannot see.
+  if (await isNewLinktreeLinksPage(page)) {
+    return applyNewUiUpdates(page, updates, onProgress);
+  }
 
   // 排序：TOGGLE_OFF → UPDATE → TOGGLE_ON → ADD
   const actionOrder = { 'toggle_off': 0, 'update': 1, 'toggle_on': 2, 'add': 3 };
@@ -315,6 +759,7 @@ export async function applyLinktreeUpdates(page, updates) {
     // ─── ADD：建立全新卡片 ────────────────────────────
     if (action === 'add') {
       await handleAddCard(page, newTitle, newUrl, type);
+      await onProgress?.({ success: true, update });
       continue;
     }
 
@@ -323,6 +768,82 @@ export async function applyLinktreeUpdates(page, updates) {
     let card = null;
     let cardTitleInput = null;
     let cardUrlInput = null;
+
+    if (titleInputs.length === 0) {
+      if (type === 'header') {
+        console.log(`[Linktree] Header "${newTitle}" confirmed in list structure.`);
+        await onProgress?.({ success: true, update });
+        continue;
+      }
+
+      // Expand collection list (e.g., 館內活動)
+      const listNames = ['館內活動', '親職講座', '外聘課程', '育兒資源'];
+      for (const name of listNames) {
+        const btn = page.getByRole('button', { name: new RegExp(name) }).first();
+        if (await btn.count() > 0) {
+          await btn.click().catch(() => {});
+          await page.waitForTimeout(500);
+        }
+      }
+
+      // Find card in new UI
+      let cardBtn = page.getByText(currentTitle).first();
+      if (await cardBtn.count() === 0) {
+        cardBtn = page.getByText(/活動表/).first();
+      }
+
+      if (await cardBtn.count() > 0) {
+        console.log('[Linktree] Found card in new UI. Opening editor...');
+        await cardBtn.click();
+        await page.waitForTimeout(1500);
+
+        // 1. Update URL first
+        if (newUrl) {
+          const editUrlBtn = page.getByRole('button', { name: 'Edit URL' }).first();
+          if (await editUrlBtn.count() > 0) {
+            console.log('[Linktree] Editing URL in new UI...');
+            await editUrlBtn.click();
+            await page.waitForTimeout(800);
+
+            const urlInp = page.locator('input[placeholder="Enter URL..."]').first();
+            if (await urlInp.count() > 0) {
+              await urlInp.fill(newUrl);
+              await page.waitForTimeout(500);
+
+              const confirmBtn = page.locator('button[aria-label="Confirm"]').first();
+              if (await confirmBtn.count() > 0) {
+                await confirmBtn.click();
+                console.log('[Linktree] Waiting 3s for Linktree auto-fetch...');
+                await page.waitForTimeout(3000);
+              }
+            }
+          }
+        }
+
+        // 2. Update Title second (to overwrite auto-fetched webpage title)
+        if (newTitle) {
+          const titleInp = page.locator('input[placeholder*="title"]').first();
+          if (await titleInp.count() > 0) {
+            console.log(`[Linktree] Setting title in new UI: "${newTitle}"...`);
+            await titleInp.click();
+            await titleInp.fill(newTitle);
+            await titleInp.press('Enter');
+            await titleInp.press('Tab');
+            await page.waitForTimeout(2000);
+            console.log('[Linktree] ✅ Card title updated in new UI.');
+          }
+        }
+
+        await page.goto('https://linktr.ee/admin/links', { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
+        await onProgress?.({ success: true, update });
+        continue;
+      } else {
+        console.log(`[Linktree] ⚠️ WARNING: Could not find card for "${currentTitle}" in new UI.`);
+        await onProgress?.({ success: false, update, error: '找不到卡片' });
+        continue;
+      }
+    }
 
     for (const titleInput of titleInputs) {
       const val = (await titleInput.inputValue() || '').trim();
@@ -349,6 +870,7 @@ export async function applyLinktreeUpdates(page, updates) {
 
     if (!card || !cardTitleInput) {
       console.log(`[Linktree] ⚠️ WARNING: Could not locate card with Title "${currentTitle}". Skipping.`);
+      await onProgress?.({ success: false, update, error: '找不到卡片' });
       continue;
     }
 
@@ -371,6 +893,7 @@ export async function applyLinktreeUpdates(page, updates) {
           console.log('[Linktree] Card is already inactive.');
         }
       }
+      await onProgress?.({ success: true, update });
       continue;
     }
 
@@ -456,10 +979,12 @@ export async function applyLinktreeUpdates(page, updates) {
     }
 
     console.log('[Linktree] ✅ Card update complete.');
+    await onProgress?.({ success: true, update });
   }
 
   await page.waitForTimeout(2000);
   console.log('\n[Linktree] ═══ All card updates finished. ═══');
+  return { success: true, applied: sortedUpdates, failed: [] };
 }
 
 // ─── Private: Add Card ──────────────────────────────────

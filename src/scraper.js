@@ -47,6 +47,42 @@ function downloadImage(url, filepath) {
   });
 }
 
+function normalizeExternalUrl(value) {
+  try {
+    const url = new URL(value);
+    url.searchParams.delete('fbclid');
+    return url.toString();
+  } catch (_) {
+    return value;
+  }
+}
+
+function extractTextUrls(textContent) {
+  return [...String(textContent || '').matchAll(/https?:\/\/[^\s<>"）)]+/g)]
+    .map(match => normalizeExternalUrl(match[0]))
+    .filter(url => !url.includes('facebook.com'));
+}
+
+export function selectCalendarImageCandidate(images, month) {
+  const plausible = images
+    .filter(image => {
+      const ratio = image.width / image.height;
+      return /(?:fbcdn\.net|scontent)/.test(image.src || '') &&
+        image.width >= 500 && image.height >= 280 &&
+        ratio >= 1.5 && ratio <= 2.05 &&
+        !/profile|頭像|icon/i.test(image.alt || '');
+    })
+    .map(image => ({
+      ...image,
+      score: new RegExp(`${month}月`).test(image.alt || '') ? 2 :
+        /活動表|課程表|行事曆/.test(image.alt || '') ? 1 : 0
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  if (plausible.length > 1 && plausible[0].score === plausible[1].score) return null;
+  return plausible[0] || null;
+}
+
 /**
  * 爬取 Facebook 專頁貼文，搜尋符合關鍵字的貼文
  * @param {string} pageUrl - Facebook 專頁 URL
@@ -68,16 +104,16 @@ export async function scrapeFacebookPosts(pageUrl, keyword) {
     // 導航至 Facebook 專頁
     console.log('[Scraper] Navigating to Facebook page...');
     await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(5000);
-
-    // 等待 React 渲染貼文
+    // Wait for actual post content instead of a fixed ten-second delay.
     console.log('[Scraper] Waiting for React to render posts...');
-    await page.waitForTimeout(5000);
+    await page.waitForSelector('div[data-ad-preview="message"]', { timeout: 15000 });
 
     // 動態捲動並搜尋貼文，防止 React Virtual DOM 卸載頂部貼文
     console.log('[Scraper] Dynamically scrolling and searching for posts...');
     let targetArticle = null;
     const foundPostsText = new Set();
+    const monthPrefix = keyword.split('月')[0] + '月';
+    const baseKeywordStr = keyword.replace(monthPrefix, '');
 
     for (let i = 0; i < 10; i++) {
       const articles = await page.$$('div[data-ad-preview="message"]');
@@ -100,7 +136,7 @@ export async function scrapeFacebookPosts(pageUrl, keyword) {
           const button = await article.$(selector);
           if (button) {
             await button.evaluate(el => el.click()).catch(() => null);
-            await page.waitForTimeout(1000);
+            await page.waitForTimeout(250);
             break;
           }
         }
@@ -113,10 +149,6 @@ export async function scrapeFacebookPosts(pageUrl, keyword) {
         }
         foundPostsText.add(textContent);
 
-        // 比對月份與基礎關鍵字
-        const monthPrefix = keyword.split('月')[0] + '月';
-        const baseKeywordStr = keyword.replace(monthPrefix, '');
-
         if (textContent.includes(monthPrefix) && textContent.includes(baseKeywordStr)) {
           console.log('[Scraper Debug] Post accepted! Matching month and base keyword.');
           targetArticle = article;
@@ -128,7 +160,7 @@ export async function scrapeFacebookPosts(pageUrl, keyword) {
 
       // 向下捲動繼續搜尋
       await page.evaluate(() => window.scrollBy(0, 1000));
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(800);
 
       // 嘗試關閉新出現的遮罩
       await page.evaluate(() => {
@@ -147,7 +179,7 @@ export async function scrapeFacebookPosts(pageUrl, keyword) {
 
       // 擷取貼文中的外部連結
       const linkElements = await article.$$('a');
-      const links = [];
+      const links = extractTextUrls(textContent);
 
       for (const linkEl of linkElements) {
         const href = await linkEl.getAttribute('href');
@@ -157,83 +189,85 @@ export async function scrapeFacebookPosts(pageUrl, keyword) {
           try {
             const urlObj = new URL(href);
             const rawUrl = urlObj.searchParams.get('u');
-            if (rawUrl && !links.includes(rawUrl)) {
-              links.push(rawUrl);
+            const normalizedUrl = normalizeExternalUrl(rawUrl);
+            if (normalizedUrl && !links.includes(normalizedUrl)) {
+              links.push(normalizedUrl);
             }
           } catch (e) {
             console.error('[Scraper] Failed to parse FB redirect link:', href, e);
           }
         } else if (
           href.startsWith('http') &&
-          !href.includes('facebook.com') &&
-          !links.includes(href)
+          !href.includes('facebook.com')
         ) {
-          links.push(href);
+          const normalizedUrl = normalizeExternalUrl(href);
+          if (!links.includes(normalizedUrl)) links.push(normalizedUrl);
         }
       }
 
       console.log('[Scraper] Extracted links:', links);
 
-      // 下載活動表圖片（多模態分析用）
+      // Only inspect images belonging to the matched post. The message block
+      // itself normally contains no image. Facebook's current DOM does not
+      // always add role="article", so fall back to the nearest ancestor that
+      // owns an image (which also keeps the image scoped to this post).
       let imagePath = '';
+      let postUrl = '';
       try {
-        // 先在貼文容器內搜尋大圖
-        const imgElements = await page.locator(`div[data-ad-preview="message"] img`).all();
-        console.log(`[Scraper] Scanning ${imgElements.length} images inside post container...`);
-
-        for (const img of imgElements) {
-          const src = await img.getAttribute('src') || '';
-          const alt = await img.getAttribute('alt') || '';
-
-          if (
-            (src.includes('fbcdn.net') || src.includes('scontent')) &&
-            !alt.includes('profile') && !alt.includes('頭像') && !alt.includes('icon')
-          ) {
-            const w = await img.evaluate(el => el.naturalWidth).catch(() => 0);
-            const h = await img.evaluate(el => el.naturalHeight).catch(() => 0);
-            if (w > 400 && h > 400) {
-              console.log(`[Scraper] Found large content image in post: ${w}x${h}`);
-              const success = await downloadImage(src, TEMP_IMAGE_PATH).catch(() => false);
-              if (success) {
-                imagePath = TEMP_IMAGE_PATH;
+        const postData = await article.evaluate(element => {
+          let post = element.closest('[role="article"]');
+          if (!post || !post.querySelector('img')) {
+            let ancestor = element.parentElement;
+            while (ancestor) {
+              if (ancestor.querySelector('img')) {
+                post = ancestor;
                 break;
               }
+              ancestor = ancestor.parentElement;
             }
           }
-        }
+          post ||= element.parentElement;
 
-        // 備援：搜尋整個頁面的大圖
-        if (!imagePath) {
-          console.log('[Scraper] Image not found in article container. Falling back to whole-page search...');
-          const allImgs = await page.locator('img').all();
-          for (const img of allImgs) {
-            const src = await img.getAttribute('src') || '';
-            const alt = await img.getAttribute('alt') || '';
-
-            if (
-              (src.includes('fbcdn.net') || src.includes('scontent')) &&
-              !alt.includes('profile') && !alt.includes('頭像') && !alt.includes('icon')
-            ) {
-              const w = await img.evaluate(el => el.naturalWidth).catch(() => 0);
-              const h = await img.evaluate(el => el.naturalHeight).catch(() => 0);
-              if (w > 400 && h > 400) {
-                console.log(`[Scraper] Found large image on the page: ${w}x${h}`);
-                const success = await downloadImage(src, TEMP_IMAGE_PATH).catch(() => false);
-                if (success) {
-                  imagePath = TEMP_IMAGE_PATH;
-                  break;
-                }
-              }
+          const images = [...(post?.querySelectorAll('img') || [])].map(img => ({
+            src: img.currentSrc || img.src || '',
+            alt: img.alt || '',
+            width: img.naturalWidth,
+            height: img.naturalHeight
+          }));
+          let postUrl = '';
+          let ancestor = post;
+          while (ancestor) {
+            const anchor = [...(ancestor.querySelectorAll('a[href]') || [])].find(link =>
+              /\/posts\/|permalink\.php|story_fbid=/.test(link.href)
+            );
+            if (anchor) {
+              postUrl = anchor.href;
+              break;
             }
+            ancestor = ancestor.parentElement;
           }
+          return { postUrl, images };
+        });
+        postUrl = postData.postUrl;
+        const { images } = postData;
+        const month = Number.parseInt(keyword, 10);
+        const candidate = selectCalendarImageCandidate(images, month);
+        if (candidate) {
+          console.log(`[Scraper] Calendar candidate in matched post: ${candidate.width}x${candidate.height}`);
+          if (await downloadImage(candidate.src, TEMP_IMAGE_PATH).catch(() => false)) {
+            imagePath = TEMP_IMAGE_PATH;
+          }
+        } else {
+          console.warn(`[Scraper] No unique calendar image found among ${images.length} images in matched post.`);
         }
       } catch (imgErr) {
-        console.log('[Scraper] Non-critical error downloading calendar image:', imgErr.message);
+        console.warn('[Scraper] Calendar image unavailable:', imgErr.message);
       }
 
       foundPosts.push({
         text: textContent,
         links,
+        postUrl,
         imagePath,
         scrapedAt: new Date().toISOString()
       });

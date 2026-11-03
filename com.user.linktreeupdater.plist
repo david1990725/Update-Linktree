@@ -6,8 +6,17 @@
     <string>com.user.linktreeupdater</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mis-davidliao/Documents/Update Linktree/run.sh</string>
+        <string>/Users/mis-davidliao/Documents/GitHub/Update Linktree/run.sh</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/mis-davidliao/Documents/GitHub/Update Linktree</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUN_MODE</key>
+        <string>plan</string>
+        <key>HEADLESS</key>
+        <string>true</string>
+    </dict>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -16,8 +25,8 @@
         <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/mis-davidliao/Documents/Update Linktree/launchd_stdout.log</string>
+    <string>/Users/mis-davidliao/Documents/GitHub/Update Linktree/launchd_stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/mis-davidliao/Documents/Update Linktree/launchd_stderr.log</string>
+    <string>/Users/mis-davidliao/Documents/GitHub/Update Linktree/launchd_stderr.log</string>
 </dict>
 </plist>

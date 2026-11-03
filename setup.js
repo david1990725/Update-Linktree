@@ -3,10 +3,9 @@ import readline from 'readline';
 import * as dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { BROWSER_DATA_DIR, BROWSER_OPTIONS } from './src/config.js';
 
 dotenv.config();
-
-const BROWSER_DATA_DIR = './browser_data';
 
 async function main() {
   console.log('==================================================');
@@ -29,9 +28,8 @@ async function main() {
 
   console.log('Launching browser...');
   const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
-    headless: false,
-    viewport: { width: 1280, height: 800 },
-    args: ['--disable-blink-features=AutomationControlled'] // Help prevent immediate bot alerts
+    ...BROWSER_OPTIONS,
+    headless: false
   });
 
   const page1 = await context.newPage();

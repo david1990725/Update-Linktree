@@ -6,7 +6,11 @@
   "type": "module",
   "scripts": {
     "setup": "node setup.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "dashboard": "node dashboard.js",
+    "plan": "RUN_MODE=plan node index.js",
+    "test": "node --test tests/*.test.js",
+    "check": "node --check dashboard.js && node --check public/app.js && node --check index.js && node --check setup.js && node --check src/config.js && node --check src/database.js && node --check src/scraper.js && node --check src/classifier.js && node --check src/model-selection.js && node --check src/linktree.js && node --check src/review.js"
   },
   "dependencies": {
     "@google/genai": "^2.6.0",
